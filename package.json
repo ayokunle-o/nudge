@@ -5,10 +5,12 @@
     "build": "rm -rf www && mkdir -p www && cp src/index.html src/styles.css www/ && esbuild src/app.js --bundle --format=iife --target=chrome90 --minify --outfile=www/app.js"
   },
   "dependencies": {
+    "@breezystack/lamejs": "^1.2.7",
     "@capacitor/android": "^8.5.3",
     "@capacitor/app": "^8.1.2",
     "@capacitor/cli": "^8.5.3",
     "@capacitor/core": "^8.5.3",
+    "@capacitor/filesystem": "^8.1.4",
     "@capacitor/local-notifications": "^8.3.1",
     "@capacitor/preferences": "^8.0.1"
   },

@@ -176,3 +176,19 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
 .timeline li::before { content: ""; position: absolute; left: -20px; top: 6px; width: 10px; height: 10px; border-radius: 50%; background: var(--surface); border: 2px solid var(--follow); }
 .timeline li:last-child::before { background: var(--follow); }
 .timeline span { display: block; font-size: 12px; font-weight: 600; color: var(--muted); }
+
+/* Saved recordings being processed */
+.job {
+  display: flex; gap: 12px; align-items: flex-start; flex-wrap: wrap;
+  background: var(--surface); border: 1px dashed var(--line); border-radius: var(--radius);
+  padding: 14px; margin-bottom: 8px;
+}
+.job-body { flex: 1; min-width: 0; }
+.job.failed { border-style: solid; border-color: var(--accent); }
+.job-actions { display: flex; gap: 8px; justify-content: flex-end; width: 100%; }
+.spinner {
+  flex: none; width: 22px; height: 22px; margin-top: 2px; border-radius: 50%;
+  border: 2.5px solid var(--line); border-top-color: var(--accent); animation: spin .9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }

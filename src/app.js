@@ -2,6 +2,8 @@ import { Capacitor } from '@capacitor/core';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { Preferences } from '@capacitor/preferences';
 import { App } from '@capacitor/app';
+import { Filesystem, Directory } from '@capacitor/filesystem';
+import { Mp3Encoder } from '@breezystack/lamejs';
 
 const isNative = Capacitor.isNativePlatform();
 const $ = (s) => document.querySelector(s);
@@ -205,7 +207,7 @@ function changeSummary({ created, updated }) {
   return parts.join(' · ');
 }
 
-/* ---------------- Recording (WAV, 16 kHz mono) ---------------- */
+/* ---------------- Recording (16 kHz mono, MP3 for small uploads) ---------------- */
 let rec = null;
 
 async function startRecording() {
@@ -226,13 +228,42 @@ async function stopRecording() {
   src.disconnect(); proc.disconnect();
   stream.getTracks().forEach((t) => t.stop());
   const rate = ctx.sampleRate;
-  await ctx.close();
+  await ctx.close().catch(() => {});
   const len = chunks.reduce((n, c) => n + c.length, 0);
   if (len < rate * 0.8) return null; // under ~1 second: treat as accidental tap
-  return encodeWav(chunks, len, rate);
+  const pcm = new Int16Array(len);
+  let o = 0;
+  for (const c of chunks) for (let i = 0; i < c.length; i++, o++) {
+    const v = Math.max(-1, Math.min(1, c[i]));
+    pcm[o] = v < 0 ? v * 0x8000 : v * 0x7fff;
+  }
+  const seconds = Math.round(len / rate);
+  try {
+    return { data: toBase64(encodeMp3(pcm, rate)), mime: 'audio/mp3', seconds };
+  } catch (e) {
+    console.error('mp3 encode failed, using wav', e);
+    return { data: toBase64(encodeWav(pcm, rate)), mime: 'audio/wav', seconds };
+  }
 }
 
-function encodeWav(chunks, len, rate) {
+function encodeMp3(pcm, rate) {
+  const enc = new Mp3Encoder(1, rate, 32); // 32 kbps mono: ~240 KB per minute, plenty for speech
+  const parts = [];
+  for (let i = 0; i < pcm.length; i += 1152) {
+    const out = enc.encodeBuffer(pcm.subarray(i, i + 1152));
+    if (out.length) parts.push(out);
+  }
+  const end = enc.flush();
+  if (end.length) parts.push(end);
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const bytes = new Uint8Array(total);
+  let o = 0;
+  for (const p of parts) { bytes.set(p, o); o += p.length; }
+  return bytes;
+}
+
+function encodeWav(pcm, rate) {
+  const len = pcm.length;
   const buf = new ArrayBuffer(44 + len * 2);
   const v = new DataView(buf);
   const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
@@ -240,15 +271,103 @@ function encodeWav(chunks, len, rate) {
   v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
   v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
   w(36, 'data'); v.setUint32(40, len * 2, true);
-  let o = 44;
-  for (const c of chunks) for (let i = 0; i < c.length; i++, o += 2) {
-    const s = Math.max(-1, Math.min(1, c[i]));
-    v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-  }
+  new Int16Array(buf, 44).set(pcm);
+  return new Uint8Array(buf);
+}
+
+function toBase64(bytes) {
   let bin = '';
-  const bytes = new Uint8Array(buf);
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
   return btoa(bin);
+}
+
+/* ---------------- Saved recordings queue ----------------
+   Every recording is written to the phone before it is sent, so nothing is lost if the app is
+   minimised, closed by Android, or offline. Unfinished ones are retried when the app opens. */
+let jobs = [];
+const inFlight = new Set();
+let appActive = true;
+
+const saveJobs = () => Preferences.set({ key: 'jobs', value: JSON.stringify(jobs) });
+async function loadJobs() {
+  const j = await Preferences.get({ key: 'jobs' });
+  try { if (j.value) jobs = JSON.parse(j.value); } catch {}
+}
+
+async function queueRecording(audio) {
+  const id = `r${Date.now().toString(36)}`;
+  const file = `${id}.${audio.mime === 'audio/mp3' ? 'mp3' : 'wav'}`;
+  await Filesystem.writeFile({ path: file, data: audio.data, directory: Directory.Data });
+  const job = { id, file, mime: audio.mime, seconds: audio.seconds, createdAt: new Date().toISOString(), status: 'pending', error: null };
+  jobs.push(job);
+  await saveJobs();
+  render();
+  processJob(job, audio.data);
+}
+
+async function processJob(job, data) {
+  if (inFlight.has(job.id)) return;
+  inFlight.add(job.id);
+  job.status = 'pending'; job.error = null;
+  render();
+  try {
+    if (!data) data = (await Filesystem.readFile({ path: job.file, directory: Directory.Data })).data;
+    const result = await understand([{ text: prompt(true) }, { inline_data: { mime_type: job.mime, data } }]);
+    const change = applyResult(result);
+    jobs = jobs.filter((j) => j.id !== job.id);
+    await saveJobs();
+    await Filesystem.deleteFile({ path: job.file, directory: Directory.Data }).catch(() => {});
+    await commit();
+    const summary = change.created || change.updated ? changeSummary(change) : "Didn't catch anything to save";
+    if (appActive) {
+      if (change.created || change.updated) toast(summary, 'Undo', async () => { change.undo(); await commit(); });
+      else toast(summary);
+    } else {
+      notifyNow('Recording sorted', summary);
+    }
+  } catch (e) {
+    job.status = 'failed';
+    job.error = friendlyError(e);
+    await saveJobs();
+    if (!appActive) notifyNow("Couldn't sort your recording", `${job.error} It's saved. Open Nudge to retry.`);
+  } finally {
+    inFlight.delete(job.id);
+    render();
+  }
+}
+
+function retryJobs() {
+  for (const j of jobs) if (!inFlight.has(j.id)) processJob(j);
+}
+
+async function discardJob(id) {
+  const job = jobs.find((j) => j.id === id);
+  if (!job) return;
+  jobs = jobs.filter((j) => j.id !== id);
+  await saveJobs();
+  await Filesystem.deleteFile({ path: job.file, directory: Directory.Data }).catch(() => {});
+  render();
+}
+
+async function notifyNow(title, body) {
+  if (!isNative) return;
+  try {
+    await LocalNotifications.schedule({ notifications: [{ id: 990 + Math.floor(Math.random() * 9), title, body, channelId: 'nudges', schedule: { at: new Date(Date.now() + 500), allowWhileIdle: true } }] });
+  } catch (e) { console.error(e); }
+}
+
+const dur = (s) => `${Math.floor(s / 60)}:${pad(s % 60)}`;
+function jobsHtml() {
+  if (!jobs.length) return '';
+  return `<section class="group">${jobs.map((j) => j.status === 'failed'
+    ? `<article class="job failed" data-job="${j.id}">
+        <div class="job-body"><p class="text">Couldn't sort a ${dur(j.seconds)} recording</p><p class="context">${esc(j.error || '')} It's saved on your phone.</p></div>
+        <div class="job-actions"><button class="text-btn danger" data-job-act="discard">Discard</button><button class="primary" data-job-act="retry">Retry</button></div>
+      </article>`
+    : `<article class="job" data-job="${j.id}">
+        <span class="spinner" aria-hidden="true"></span>
+        <div class="job-body"><p class="text">Sorting a ${dur(j.seconds)} recording…</p><p class="context">Saved on your phone. You can leave the app; you'll get a notification when it's done.</p></div>
+      </article>`).join('')}</section>`;
 }
 
 /* ---------------- Notifications ---------------- */
@@ -375,12 +494,13 @@ function render() {
   const later = open.filter((i) => i.startDate > t).sort((a, b) => a.startDate.localeCompare(b.startDate));
   const done = items.filter((i) => i.done).sort((a, b) => (b.doneAt || '').localeCompare(a.doneAt || ''));
 
-  if (!items.length) {
+  if (!items.length && !jobs.length) {
     $('#list').innerHTML = `<div class="empty"><h2>Nothing to remember yet</h2><p>After a conversation, tap the mic and just talk. Nudge sorts it out and checks in with you morning, afternoon and night.</p></div>`;
     return;
   }
 
-  let html = '';
+  let html = jobsHtml();
+  if (!items.length) { $('#list').innerHTML = html; return; }
   html += `<section class="group"><div class="group-head"><h2>On your mind today</h2><span class="count">${now.length}</span></div>${
     now.length ? now.map(cardHtml).join('') : `<p class="context" style="margin:0 2px">All clear for today.</p>`}</section>`;
 
@@ -440,23 +560,20 @@ async function beginCapture() {
 }
 
 async function finishCapture() {
+  if (!rec) return;
   clearInterval(timerInt);
   const ov = $('#rec');
   ov.classList.add('busy');
-  $('#rec-state').textContent = 'Sorting it out';
-  $('#rec-hint').textContent = 'Pulling out what to remember…';
-  const b64 = await stopRecording();
-  if (!b64) { ov.hidden = true; toast('That was too short. Hold on a little longer.'); return; }
+  $('#rec-state').textContent = 'Saving';
+  $('#rec-hint').textContent = 'One moment…';
+  let audio = null;
+  try { audio = await stopRecording(); } catch (e) { console.error(e); }
+  ov.hidden = true;
+  if (!audio) { toast('That was too short. Hold on a little longer.'); return; }
   try {
-    const result = await understand([{ text: prompt(true) }, { inline_data: { mime_type: 'audio/wav', data: b64 } }]);
-    const change = applyResult(result);
-    ov.hidden = true;
-    await commit();
-    if (change.created || change.updated) toast(changeSummary(change), 'Undo', async () => { change.undo(); await commit(); });
-    else toast("Didn't catch anything to save");
+    await queueRecording(audio);
   } catch (e) {
-    ov.hidden = true;
-    toast(friendlyError(e));
+    toast(`Couldn't save the recording: ${friendlyError(e)}`);
   }
 }
 
@@ -530,6 +647,13 @@ function bind() {
   };
 
   $('#list').addEventListener('click', async (e) => {
+    const jb = e.target.closest('[data-job-act]');
+    if (jb) {
+      const id = jb.closest('[data-job]').dataset.job;
+      if (jb.dataset.jobAct === 'retry') { const j = jobs.find((x) => x.id === id); if (j) processJob(j); }
+      else discardJob(id);
+      return;
+    }
     const btn = e.target.closest('[data-act]');
     if (!btn) return;
     if (btn.dataset.act === 'clear-done') {
@@ -594,13 +718,19 @@ function bind() {
     toast('Sending in 3 seconds');
   };
 
-  App.addListener('appStateChange', ({ isActive }) => { if (isActive) { render(); reschedule(); } });
+  App.addListener('appStateChange', ({ isActive }) => {
+    appActive = isActive;
+    if (!isActive && rec) finishCapture(); // leaving mid-recording saves what was said so far
+    if (isActive) { render(); reschedule(); retryJobs(); }
+  });
 }
 
 (async function init() {
   await load();
+  await loadJobs();
   bind();
   render();
+  retryJobs();
   await setupNotifications();
   await reschedule();
 })();
