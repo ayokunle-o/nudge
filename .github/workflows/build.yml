@@ -1,0 +1,60 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Build web app
+        run: |
+          npm ci
+          npm run build
+
+      - name: Create Android project
+        run: |
+          npx cap add android
+          bash android-res/apply.sh
+          npx cap sync android
+
+      - name: Use the fixed signing key (so updates install over the old version)
+        run: |
+          mkdir -p ~/.android
+          cp android-res/debug.keystore ~/.android/debug.keystore
+
+      - name: Compile APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Rename
+        run: cp android/app/build/outputs/apk/debug/app-debug.apk Nudge.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nudge-apk
+          path: Nudge.apk
+
+      - name: Publish as the "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest Nudge.apk --title "Nudge (latest build)" --notes "Built from ${GITHUB_SHA::7}. Download Nudge.apk on your phone and install it."

@@ -1,0 +1,10 @@
+{
+  "appId": "com.ayokunle.nudge",
+  "appName": "Nudge",
+  "webDir": "www",
+  "plugins": {
+    "CapacitorHttp": { "enabled": true },
+    "LocalNotifications": { "smallIcon": "ic_stat_nudge", "iconColor": "#C8502A" }
+  },
+  "android": { "backgroundColor": "#F5F1EA" }
+}
