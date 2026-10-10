@@ -162,3 +162,17 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
 @media (prefers-color-scheme: dark) { .toast .text-btn { color: #c8502a; } }
 .times input { min-width: 0; padding: 12px 8px; font-size: 15px; }
 .banner .text-btn { white-space: nowrap; }
+
+/* Progressive context */
+.update {
+  display: block; width: 100%; text-align: left; margin-top: 8px; padding: 8px 10px;
+  background: var(--bg); border-radius: 10px; font-size: 14px; color: var(--ink); line-height: 1.4;
+  border-left: 3px solid var(--follow);
+}
+.update-day { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 1px; }
+#item-history h3 { margin: 0 0 8px; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.timeline { list-style: none; margin: 0 0 4px; padding: 0 0 0 14px; border-left: 2px solid var(--line); display: flex; flex-direction: column; gap: 10px; }
+.timeline li { position: relative; font-size: 14px; }
+.timeline li::before { content: ""; position: absolute; left: -20px; top: 6px; width: 10px; height: 10px; border-radius: 50%; background: var(--surface); border: 2px solid var(--follow); }
+.timeline li:last-child::before { background: var(--follow); }
+.timeline span { display: block; font-size: 12px; font-weight: 600; color: var(--muted); }

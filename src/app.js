@@ -52,6 +52,9 @@ const SCHEMA = {
       items: {
         type: 'OBJECT',
         properties: {
+          existing_id: { type: 'STRING', nullable: true },
+          update: { type: 'STRING', nullable: true },
+          status: { type: 'STRING', enum: ['open', 'done'] },
           text: { type: 'STRING' },
           kind: { type: 'STRING', enum: ['follow-up', 'to-do', 'keep in mind'] },
           person: { type: 'STRING', nullable: true },
@@ -59,29 +62,47 @@ const SCHEMA = {
           start_date: { type: 'STRING' },
           remind_at: { type: 'STRING', nullable: true },
         },
-        required: ['text', 'kind', 'start_date'],
+        required: ['text', 'kind', 'start_date', 'status'],
       },
     },
   },
   required: ['transcript', 'items'],
 };
 
+// What Gemini sees of the current list, so new recordings can update old items.
+function knownItems() {
+  const cutoff = ymd(addDays(new Date(), -21));
+  const pool = items.filter((i) => !i.done || (i.doneAt || '').slice(0, 10) >= cutoff).slice(0, 80);
+  if (!pool.length) return 'None yet.';
+  return pool.map((i) => {
+    const hist = (i.history || []).slice(-3).map((h) => `${h.at.slice(0, 10)}: ${h.note}`).join(' | ');
+    return `- id=${i.id} [${i.done ? 'done' : 'open'}, ${i.kind}${i.person ? `, about ${i.person}` : ''}, created ${i.createdAt.slice(0, 10)}] ${i.text}` +
+      (i.context ? ` (detail: ${i.context})` : '') + (hist ? ` (updates: ${hist})` : '');
+  }).join('\n');
+}
+
 function prompt(isAudio) {
   const now = new Date();
-  return `You turn a ${isAudio ? 'voice memo' : 'quick note'} into reminder items for the person speaking.
+  return `You turn a ${isAudio ? 'voice memo' : 'quick note'} into reminder items for the person speaking, and keep his existing items up to date.
 Right now it is ${now.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })}, ${pad(now.getHours())}:${pad(now.getMinutes())} local time (UTC${tzOffset()}). Today's date is ${todayStr()}.
 
-He usually records this right after a conversation (often with his wife) or when something crosses his mind. He wants to remember to follow up, show he was listening, and not drop things.
+He usually records this right after a conversation (often with his wife) or when something crosses his mind. He wants to remember to follow up, show he was listening, and not drop things. Stories develop over days, so he will often give updates on things he mentioned before.
 
-Extract every distinct thing worth remembering. For each item:
-- text: short and actionable, written as a note to himself, under 90 characters. Example: "Ask how her interview went". Keep names and nicknames exactly as he said them.
+His current items:
+${knownItems()}
+
+For every distinct thing in what he says, return one entry:
+- existing_id: if it is news about, or a continuation of, one of his current items (same person and same topic, even if worded differently, e.g. "the interview" / "her job thing"), the id of that item. Otherwise null. Never create a new entry for something that matches an existing item.
+- update: when existing_id is set, one short line saying what's new, in his terms (e.g. "Interview went well, she's waiting to hear back by Friday"). Otherwise null.
+- status: "done" only if the matter is fully resolved and there is nothing left to follow up on; otherwise "open".
+- text: the next thing to remember or do, short and actionable, written as a note to himself, under 90 characters. For an update, rewrite it to the new next step (e.g. "Ask if she's heard back about the job"). Keep names and nicknames exactly as he said them.
 - kind: "follow-up" (check in with or ask someone about something), "to-do" (something to do), or "keep in mind" (a fact or detail to remember, e.g. a preference or date).
-- person: who it is about, as he referred to them, or null.
-- context: one short line of useful detail he mentioned (time, place, why it matters), or null.
-- start_date: YYYY-MM-DD for when nudges should begin. Default today. If the follow-up only makes sense after an event (e.g. an interview tomorrow), use the event's date. If he says "tomorrow", "next week", "on Friday", resolve it to the date.
+- person: who it is about, as he referred to them, or null. For an update, keep the existing item's person unless he says otherwise.
+- context: one short line of the most useful current detail (time, place, why it matters), or null.
+- start_date: YYYY-MM-DD for when the next nudges should begin. Default today. If the next step only makes sense after an event or a date he mentions, use that date. Resolve "tomorrow", "next week", "on Friday" to a date.
 - remind_at: full ISO 8601 local datetime with offset (e.g. ${localIso(addDays(now, 1)).slice(0, 11)}09:00:00${tzOffset()}) ONLY if he gave or clearly implied a specific time ("at 3pm", "after her 10am interview" -> shortly after 10am, "tomorrow morning" -> 09:00). Otherwise null.
 
-Ignore filler and repetition. Do not invent items. If nothing is worth saving, return an empty items list.
+Ignore filler and repetition. Do not invent items or updates. Leave untouched any existing item he does not mention. If nothing is worth saving, return an empty items list.
 Also return "transcript": a clean, lightly punctuated transcript of what he said.`;
 }
 
@@ -115,9 +136,16 @@ async function understand(parts) {
   }
 }
 
-function addFromResult(result, source) {
+const KINDS = ['follow-up', 'to-do', 'keep in mind'];
+
+// Applies Gemini's result: updates matched items, adds new ones. Returns what changed plus an undo.
+function applyResult(result, source) {
   const t = todayStr();
+  const nowIso = new Date().toISOString();
+  const transcript = result.transcript || source || '';
   const created = [];
+  const before = new Map(); // id -> copy of item before this change
+
   for (const r of result.items || []) {
     if (!r.text) continue;
     let remindAt = null;
@@ -125,21 +153,56 @@ function addFromResult(result, source) {
     let start = /^\d{4}-\d{2}-\d{2}$/.test(r.start_date || '') ? r.start_date : t;
     if (remindAt) { const rd = ymd(new Date(remindAt)); if (rd < start) start = rd; }
     if (start < t) start = t;
+    const done = r.status === 'done';
+
+    const existing = r.existing_id && items.find((i) => i.id === r.existing_id);
+    if (existing) {
+      if (!before.has(existing.id)) before.set(existing.id, JSON.parse(JSON.stringify(existing)));
+      if (!existing.origin) existing.origin = existing.context ? `${existing.text} (${existing.context})` : existing.text;
+      existing.history = [...(existing.history || []), { at: nowIso, note: (r.update || r.context || r.text).trim() }];
+      existing.text = r.text.trim();
+      if (KINDS.includes(r.kind)) existing.kind = r.kind;
+      if (r.person) existing.person = r.person;
+      existing.context = r.context || null;
+      existing.startDate = start;
+      existing.remindAt = remindAt;
+      existing.done = done;
+      existing.doneAt = done ? nowIso : null;
+      existing.updatedAt = nowIso;
+      continue;
+    }
     created.push({
       id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`,
       text: r.text.trim(),
-      kind: ['follow-up', 'to-do', 'keep in mind'].includes(r.kind) ? r.kind : 'to-do',
+      kind: KINDS.includes(r.kind) ? r.kind : 'to-do',
       person: r.person || null,
       context: r.context || null,
       startDate: start,
       remindAt,
-      done: false,
-      createdAt: new Date().toISOString(),
-      transcript: result.transcript || source || '',
+      done,
+      doneAt: done ? nowIso : null,
+      createdAt: nowIso,
+      history: [],
+      origin: r.context ? `${r.text.trim()} (${r.context})` : r.text.trim(),
+      transcript,
     });
   }
   items = [...created, ...items];
-  return created;
+  // Updated items move to the top so they're easy to spot.
+  if (before.size) items = [...items.filter((i) => before.has(i.id)), ...items.filter((i) => !before.has(i.id))];
+
+  const undo = () => {
+    const ids = new Set(created.map((c) => c.id));
+    items = items.filter((i) => !ids.has(i.id)).map((i) => before.get(i.id) || i);
+  };
+  return { created: created.length, updated: before.size, undo };
+}
+
+function changeSummary({ created, updated }) {
+  const parts = [];
+  if (created) parts.push(`Added ${created}`);
+  if (updated) parts.push(`Updated ${updated}`);
+  return parts.join(' · ');
 }
 
 /* ---------------- Recording (WAV, 16 kHz mono) ---------------- */
@@ -267,6 +330,21 @@ const KIND_CLASS = { 'follow-up': 'follow-up', 'to-do': 'to-do', 'keep in mind':
 const KIND_LABEL = { 'follow-up': 'Follow up', 'to-do': 'To do', 'keep in mind': 'Keep in mind' };
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+function shortDay(iso) {
+  const d = ymd(new Date(iso));
+  if (d === todayStr()) return 'Today';
+  if (d === ymd(addDays(new Date(), -1))) return 'Yesterday';
+  return new Date(iso).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
+}
+
+function latestUpdate(i) {
+  const h = i.history || [];
+  if (!h.length) return '';
+  const last = h[h.length - 1];
+  const more = h.length > 1 ? ` · ${h.length} updates` : '';
+  return `<button class="update" data-act="edit"><span class="update-day">${shortDay(last.at)}${more}</span>${esc(last.note)}</button>`;
+}
+
 function cardHtml(i) {
   const chips = [`<span class="chip ${KIND_CLASS[i.kind] || ''}">${KIND_LABEL[i.kind] || i.kind}</span>`];
   if (i.person) chips.push(`<span class="chip">${esc(i.person)}</span>`);
@@ -278,6 +356,7 @@ function cardHtml(i) {
     <div class="card-body">
       <p class="text">${esc(i.text)}</p>
       ${i.context ? `<p class="context">${esc(i.context)}</p>` : ''}
+      ${latestUpdate(i)}
       <div class="meta">${chips.join('')}</div>
     </div>
     <button class="more" data-act="edit" aria-label="Edit">
@@ -370,14 +449,10 @@ async function finishCapture() {
   if (!b64) { ov.hidden = true; toast('That was too short. Hold on a little longer.'); return; }
   try {
     const result = await understand([{ text: prompt(true) }, { inline_data: { mime_type: 'audio/wav', data: b64 } }]);
-    const created = addFromResult(result);
+    const change = applyResult(result);
     ov.hidden = true;
     await commit();
-    if (created.length) toast(`Added ${created.length} ${created.length === 1 ? 'nudge' : 'nudges'}`, 'Undo', async () => {
-      const ids = new Set(created.map((c) => c.id));
-      items = items.filter((i) => !ids.has(i.id));
-      await commit();
-    });
+    if (change.created || change.updated) toast(changeSummary(change), 'Undo', async () => { change.undo(); await commit(); });
     else toast("Didn't catch anything to save");
   } catch (e) {
     ov.hidden = true;
@@ -400,7 +475,7 @@ function friendlyError(e) {
 }
 
 /* ---------------- Sheets ---------------- */
-function openSheet(id) { $(id).hidden = false; }
+function openSheet(id) { $('#toast').hidden = true; $(id).hidden = false; }
 function closeSheets() { document.querySelectorAll('.sheet').forEach((s) => (s.hidden = true)); }
 
 function openSettings() {
@@ -418,6 +493,10 @@ function openItem(id) {
   $('#item-edit').value = i.text;
   $('#item-date').value = i.startDate;
   $('#item-at').value = i.remindAt ? localIso(new Date(i.remindAt)).slice(0, 16) : '';
+  const story = [{ at: i.createdAt, note: `First noted: ${i.origin || i.text}` }, ...(i.history || [])];
+  $('#item-history').innerHTML = story.length > 1
+    ? `<h3>How this has developed</h3><ol class="timeline">${story.map((h) => `<li><span>${shortDay(h.at)}</span>${esc(h.note)}</li>`).join('')}</ol>`
+    : '';
   openSheet('#item-sheet');
 }
 
@@ -441,10 +520,11 @@ function bind() {
     btn.disabled = true; btn.textContent = 'Adding…';
     try {
       const result = await understand([{ text: `${prompt(false)}\n\nThe note:\n${txt}` }]);
-      const created = addFromResult(result, txt);
+      const change = applyResult(result, txt);
       closeSheets();
       await commit();
-      toast(created.length ? `Added ${created.length} ${created.length === 1 ? 'nudge' : 'nudges'}` : "Didn't find anything to save");
+      if (change.created || change.updated) toast(changeSummary(change), 'Undo', async () => { change.undo(); await commit(); });
+      else toast("Didn't find anything to save");
     } catch (e) { toast(friendlyError(e)); }
     btn.disabled = false; btn.textContent = 'Add';
   };
