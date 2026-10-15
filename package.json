@@ -6,6 +6,7 @@
   },
   "dependencies": {
     "@breezystack/lamejs": "^1.2.7",
+    "@capacitor-community/keep-awake": "^8.0.1",
     "@capacitor/android": "^8.5.3",
     "@capacitor/app": "^8.1.2",
     "@capacitor/cli": "^8.5.3",

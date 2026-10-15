@@ -192,3 +192,12 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
+
+/* Paused recording */
+.overlay .only-paused { display: none; }
+.overlay.paused .only-paused { display: revert; }
+.overlay.paused .only-live { display: none; }
+.overlay.paused #rec-resume { display: grid; }
+.overlay.paused .rec-time { color: var(--muted); }
+.rec-label { margin: -6px 0 14px; font-size: 14px; color: var(--muted); }
+.rec-actions { display: flex; gap: 12px; align-items: center; justify-content: center; }

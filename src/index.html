@@ -44,11 +44,18 @@
     <p class="eyebrow" id="rec-state">Listening</p>
     <p class="rec-time" id="rec-time">0:00</p>
     <p class="rec-hint" id="rec-hint">Talk it through. Who, what, and when if it matters.</p>
-    <button class="mic big recording" id="rec-stop" aria-label="Finish">
+    <button class="mic big recording only-live" id="rec-stop" aria-label="Finish">
       <span class="pulse"></span>
       <svg viewBox="0 0 24 24" width="30" height="30" fill="currentColor"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>
     </button>
-    <button class="text-btn" id="rec-cancel">Cancel</button>
+    <button class="mic big only-paused" id="rec-resume" aria-label="Carry on recording">
+      <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M5 10a7 7 0 0 0 14 0M12 17v5"/></svg>
+    </button>
+    <p class="rec-label only-paused">Tap to carry on talking</p>
+    <div class="rec-actions">
+      <button class="text-btn" id="rec-cancel">Discard</button>
+      <button class="primary only-paused" id="rec-finish">Finish &amp; sort</button>
+    </div>
   </div>
 </section>
 

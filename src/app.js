@@ -4,6 +4,7 @@ import { Preferences } from '@capacitor/preferences';
 import { App } from '@capacitor/app';
 import { Filesystem, Directory } from '@capacitor/filesystem';
 import { Mp3Encoder } from '@breezystack/lamejs';
+import { KeepAwake } from '@capacitor-community/keep-awake';
 
 const isNative = Capacitor.isNativePlatform();
 const $ = (s) => document.querySelector(s);
@@ -207,42 +208,111 @@ function changeSummary({ created, updated }) {
   return parts.join(' · ');
 }
 
-/* ---------------- Recording (16 kHz mono, MP3 for small uploads) ---------------- */
-let rec = null;
+/* ---------------- Recording (16 kHz mono, MP3 for small uploads) ----------------
+   A session collects audio across one or more mic segments, so a recording interrupted by the
+   screen turning off or a call can be paused and continued instead of being sent half-finished. */
+let session = null; // { chunks, rate, elapsed (ms before current segment), segStart, live }
+const MAX_MS = 10 * 60 * 1000;
 
-async function startRecording() {
+const sessionMs = () => (session ? session.elapsed + (session.live ? Date.now() - session.segStart : 0) : 0);
+
+async function startMic() {
   const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
   const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+  if (ctx.state === 'suspended') await ctx.resume().catch(() => {});
   const src = ctx.createMediaStreamSource(stream);
   const proc = ctx.createScriptProcessor(4096, 1, 1);
-  const chunks = [];
+  if (!session) session = { chunks: [], rate: ctx.sampleRate, elapsed: 0 };
+  const chunks = session.chunks;
   proc.onaudioprocess = (e) => chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
   src.connect(proc); proc.connect(ctx.destination);
-  rec = { stream, ctx, src, proc, chunks, started: Date.now() };
+  session.live = { stream, ctx, src, proc };
+  session.segStart = Date.now();
+  stayAwake(true);
 }
 
-async function stopRecording() {
-  if (!rec) return null;
-  const { stream, ctx, src, proc, chunks } = rec;
-  rec = null;
-  src.disconnect(); proc.disconnect();
+async function stopMic() {
+  if (!session?.live) return;
+  const { stream, ctx, src, proc } = session.live;
+  session.elapsed += Date.now() - session.segStart;
+  session.live = null;
+  try { src.disconnect(); proc.disconnect(); } catch {}
   stream.getTracks().forEach((t) => t.stop());
-  const rate = ctx.sampleRate;
   await ctx.close().catch(() => {});
-  const len = chunks.reduce((n, c) => n + c.length, 0);
-  if (len < rate * 0.8) return null; // under ~1 second: treat as accidental tap
+  stayAwake(false);
+}
+
+// Keeps the screen on while recording, so the phone doesn't sleep mid-sentence.
+let webLock = null;
+async function stayAwake(on) {
+  try {
+    if (isNative) { on ? await KeepAwake.keepAwake() : await KeepAwake.allowSleep(); return; }
+    if (on && navigator.wakeLock) webLock = await navigator.wakeLock.request('screen');
+    else if (!on && webLock) { await webLock.release(); webLock = null; }
+  } catch (e) { console.warn('keep awake', e); }
+}
+
+function sessionPcm() {
+  const len = session.chunks.reduce((n, c) => n + c.length, 0);
   const pcm = new Int16Array(len);
   let o = 0;
-  for (const c of chunks) for (let i = 0; i < c.length; i++, o++) {
+  for (const c of session.chunks) for (let i = 0; i < c.length; i++, o++) {
     const v = Math.max(-1, Math.min(1, c[i]));
     pcm[o] = v < 0 ? v * 0x8000 : v * 0x7fff;
   }
-  const seconds = Math.round(len / rate);
+  return pcm;
+}
+
+// Ends the session and returns encoded audio, or null if it was too short.
+async function stopRecording() {
+  if (!session) return null;
+  await stopMic();
+  const rate = session.rate;
+  const pcm = sessionPcm();
+  session = null;
+  await clearDraft();
+  if (pcm.length < rate * 0.8) return null; // under ~1 second: treat as accidental tap
+  const seconds = Math.round(pcm.length / rate);
   try {
     return { data: toBase64(encodeMp3(pcm, rate)), mime: 'audio/mp3', seconds };
   } catch (e) {
     console.error('mp3 encode failed, using wav', e);
     return { data: toBase64(encodeWav(pcm, rate)), mime: 'audio/wav', seconds };
+  }
+}
+
+/* A paused recording is also written to the phone, so it survives Android closing the app. */
+const DRAFT_FILE = 'draft.pcm';
+async function saveDraft() {
+  if (!session) return;
+  try {
+    const pcm = sessionPcm();
+    await Filesystem.writeFile({ path: DRAFT_FILE, data: toBase64(new Uint8Array(pcm.buffer)), directory: Directory.Data });
+    await Preferences.set({ key: 'draft', value: JSON.stringify({ rate: session.rate, elapsed: session.elapsed }) });
+  } catch (e) { console.error('save draft', e); }
+}
+async function clearDraft() {
+  await Preferences.remove({ key: 'draft' }).catch(() => {});
+  await Filesystem.deleteFile({ path: DRAFT_FILE, directory: Directory.Data }).catch(() => {});
+}
+async function loadDraft() {
+  try {
+    const meta = (await Preferences.get({ key: 'draft' })).value;
+    if (!meta) return false;
+    const { rate, elapsed } = JSON.parse(meta);
+    const b64 = (await Filesystem.readFile({ path: DRAFT_FILE, directory: Directory.Data })).data;
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const pcm = new Int16Array(bytes.buffer, 0, bytes.length >> 1);
+    const f = new Float32Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) f[i] = pcm[i] / 0x8000;
+    session = { chunks: [f], rate, elapsed, live: null };
+    return true;
+  } catch (e) {
+    console.error('load draft', e);
+    await clearDraft();
+    return false;
   }
 }
 
@@ -538,32 +608,74 @@ function toast(msg, actionLabel, action) {
 
 /* ---------------- Capture flow ---------------- */
 let timerInt;
-async function beginCapture() {
-  if (!settings.key.trim()) { openSettings(); toast('Add your Gemini key first'); return; }
-  try {
-    await startRecording();
-  } catch (e) {
-    toast('Microphone permission is needed to record');
-    return;
-  }
+
+function showRecording() {
   const ov = $('#rec');
-  ov.hidden = false; ov.classList.remove('busy');
+  ov.hidden = false;
+  ov.classList.remove('busy', 'paused');
   $('#rec-state').textContent = 'Listening';
   $('#rec-hint').textContent = 'Talk it through. Who, what, and when if it matters.';
-  const started = Date.now();
+  clearInterval(timerInt);
   const tick = () => {
-    const s = Math.floor((Date.now() - started) / 1000);
+    const ms = sessionMs();
+    const s = Math.floor(ms / 1000);
     $('#rec-time').textContent = `${Math.floor(s / 60)}:${pad(s % 60)}`;
-    if (s >= 300) finishCapture(); // 5-minute cap
+    if (ms >= MAX_MS) finishCapture();
   };
   tick(); timerInt = setInterval(tick, 250);
 }
 
+function showPaused(reason) {
+  clearInterval(timerInt);
+  const ov = $('#rec');
+  ov.hidden = false;
+  ov.classList.remove('busy');
+  ov.classList.add('paused');
+  const s = Math.floor(sessionMs() / 1000);
+  $('#rec-time').textContent = `${Math.floor(s / 60)}:${pad(s % 60)}`;
+  $('#rec-state').textContent = 'Paused';
+  $('#rec-hint').textContent = reason || "Recording paused when you left the app. Nothing has been sent. Carry on where you stopped, or finish now.";
+}
+
+async function beginCapture() {
+  if (!settings.key.trim()) { openSettings(); toast('Add your Gemini key first'); return; }
+  if (session) { if (!session.live) showPaused(); return; }
+  try {
+    await startMic();
+  } catch (e) {
+    session = null;
+    toast('Microphone permission is needed to record');
+    return;
+  }
+  showRecording();
+}
+
+async function resumeCapture() {
+  try {
+    await startMic();
+  } catch (e) {
+    toast('Microphone is not available right now');
+    return;
+  }
+  await clearDraft();
+  showRecording();
+}
+
+// Called when the app is sent to the background mid-recording (screen off, call, app switch).
+async function pauseCapture() {
+  if (!session?.live) return;
+  await stopMic();
+  showPaused();
+  await saveDraft();
+  notifyNow('Recording paused', `Your ${dur(Math.floor(sessionMs() / 1000))} recording is safe. Open Nudge to carry on or finish.`);
+}
+
 async function finishCapture() {
-  if (!rec) return;
+  if (!session) return;
   clearInterval(timerInt);
   const ov = $('#rec');
   ov.classList.add('busy');
+  ov.classList.remove('paused');
   $('#rec-state').textContent = 'Saving';
   $('#rec-hint').textContent = 'One moment…';
   let audio = null;
@@ -579,8 +691,12 @@ async function finishCapture() {
 
 async function cancelCapture() {
   clearInterval(timerInt);
-  await stopRecording();
+  const hadAudio = sessionMs() > 3000;
+  await stopMic();
+  session = null;
+  await clearDraft();
   $('#rec').hidden = true;
+  if (hadAudio) toast('Recording discarded');
 }
 
 function friendlyError(e) {
@@ -622,6 +738,8 @@ function bind() {
   $('#mic-btn').onclick = beginCapture;
   $('#rec-stop').onclick = finishCapture;
   $('#rec-cancel').onclick = cancelCapture;
+  $('#rec-resume').onclick = resumeCapture;
+  $('#rec-finish').onclick = finishCapture;
   $('#open-settings').onclick = openSettings;
   $('#banner-settings').onclick = openSettings;
   $('#type-btn').onclick = () => { $('#type-input').value = ''; openSheet('#type-sheet'); setTimeout(() => $('#type-input').focus(), 50); };
@@ -720,7 +838,7 @@ function bind() {
 
   App.addListener('appStateChange', ({ isActive }) => {
     appActive = isActive;
-    if (!isActive && rec) finishCapture(); // leaving mid-recording saves what was said so far
+    if (!isActive && session?.live) pauseCapture(); // screen off / call / app switch: pause, never send half a note
     if (isActive) { render(); reschedule(); retryJobs(); }
   });
 }
@@ -730,6 +848,7 @@ function bind() {
   await loadJobs();
   bind();
   render();
+  if (await loadDraft()) showPaused('You have an unfinished recording from earlier. Nothing has been sent. Carry on where you stopped, or finish now.');
   retryJobs();
   await setupNotifications();
   await reschedule();
