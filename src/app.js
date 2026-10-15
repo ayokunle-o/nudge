@@ -2,7 +2,7 @@ import { Capacitor } from '@capacitor/core';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { Preferences } from '@capacitor/preferences';
 import { App } from '@capacitor/app';
-import { Filesystem, Directory } from '@capacitor/filesystem';
+import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
 import { Mp3Encoder } from '@breezystack/lamejs';
 import { KeepAwake } from '@capacitor-community/keep-awake';
 
@@ -565,7 +565,7 @@ function render() {
   const done = items.filter((i) => i.done).sort((a, b) => (b.doneAt || '').localeCompare(a.doneAt || ''));
 
   if (!items.length && !jobs.length) {
-    $('#list').innerHTML = `<div class="empty"><h2>Nothing to remember yet</h2><p>After a conversation, tap the mic and just talk. Nudge sorts it out and checks in with you morning, afternoon and night.</p></div>`;
+    $('#list').innerHTML = `<div class="empty"><h2>Nothing to remember yet</h2><p>After a conversation, tap the mic and just talk. Nudge sorts it out and checks in with you morning, afternoon and night.</p><button class="text-btn" data-act="restore" style="margin-top:14px">Reinstalled? Restore your list from a backup</button></div>`;
     return;
   }
 
@@ -591,6 +591,94 @@ async function commit() {
   await saveItems();
   render();
   await reschedule();
+  scheduleBackup();
+}
+
+/* ---------------- Backup that survives uninstalling ----------------
+   After every change, the list is written to Documents/Nudge on the phone. That folder is
+   outside the app, so Android keeps it if Nudge is uninstalled. A fresh install can restore
+   from it through the file picker. The Gemini key is left out on purpose. */
+const BACKUP_DIR = 'Nudge';
+let backupTimer;
+let backupState = { at: null, file: null, error: null };
+
+function scheduleBackup() {
+  clearTimeout(backupTimer);
+  backupTimer = setTimeout(writeBackup, 1500);
+}
+
+async function writeBackup() {
+  if (!items.length && !backupState.at) return; // nothing worth saving yet
+  const payload = JSON.stringify({
+    app: 'nudge', version: 1, exportedAt: new Date().toISOString(),
+    items, settings: { times: settings.times, model: settings.model },
+  }, null, 1);
+  const saved = (await Preferences.get({ key: 'backupFile' })).value;
+  const names = [saved || 'Nudge-backup.json', `Nudge-backup-${Date.now().toString(36)}.json`];
+  for (const name of names) {
+    try {
+      await Filesystem.writeFile({ path: `${BACKUP_DIR}/${name}`, data: payload, directory: Directory.Documents, encoding: Encoding.UTF8, recursive: true });
+      if (name !== saved) await Preferences.set({ key: 'backupFile', value: name });
+      backupState = { at: new Date().toISOString(), file: name, error: null };
+      await Preferences.set({ key: 'backupState', value: JSON.stringify(backupState) });
+      renderBackupStatus();
+      return;
+    } catch (e) {
+      // A file left by a previous install can't be overwritten; the second name avoids that.
+      backupState.error = String(e?.message || e);
+    }
+  }
+  renderBackupStatus();
+}
+
+async function loadBackupState() {
+  try { const v = (await Preferences.get({ key: 'backupState' })).value; if (v) backupState = JSON.parse(v); } catch {}
+}
+
+function renderBackupStatus() {
+  const el = $('#backup-status');
+  if (!el) return;
+  if (backupState.at) {
+    const d = new Date(backupState.at);
+    el.textContent = `Backed up automatically ${shortDay(backupState.at).toLowerCase() === 'today' ? 'today' : shortDay(backupState.at)} at ${d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })} to Documents/Nudge/${backupState.file}. It stays on your phone even if you uninstall Nudge.`;
+  } else if (backupState.error) {
+    el.textContent = `Automatic backup isn't working on this phone (${backupState.error.slice(0, 80)}). Use "Save a copy now" instead.`;
+  } else {
+    el.textContent = 'Your list is backed up automatically to Documents/Nudge once you have something on it. It stays on your phone even if you uninstall Nudge.';
+  }
+}
+
+async function restoreFromFile(file) {
+  let data;
+  try { data = JSON.parse(await file.text()); } catch { return toast("That file isn't a Nudge backup"); }
+  if (data?.app !== 'nudge' || !Array.isArray(data.items)) return toast("That file isn't a Nudge backup");
+  const byId = new Map(items.map((i) => [i.id, i]));
+  let added = 0;
+  for (const it of data.items) {
+    if (!it?.id || !it.text) continue;
+    const cur = byId.get(it.id);
+    const stamp = (x) => x.updatedAt || x.doneAt || x.createdAt || '';
+    if (!cur) { byId.set(it.id, it); added++; }
+    else if (stamp(it) > stamp(cur)) byId.set(it.id, it);
+  }
+  items = [...byId.values()].sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+  if (data.settings?.times?.length === 3 && !(await Preferences.get({ key: 'settings' })).value) settings.times = data.settings.times;
+  await saveSettings();
+  closeSheets();
+  await commit();
+  toast(added ? `Restored ${added} ${added === 1 ? 'item' : 'items'}` : 'Everything in that backup is already here');
+}
+
+async function saveCopyNow() {
+  // Hands a copy to Android's own "save file" flow, so it can go to Downloads, Drive, WhatsApp, etc.
+  const blob = new Blob([JSON.stringify({ app: 'nudge', version: 1, exportedAt: new Date().toISOString(), items, settings: { times: settings.times, model: settings.model } }, null, 1)], { type: 'application/json' });
+  const name = `Nudge-backup-${todayStr()}.json`;
+  try {
+    const file = new File([blob], name, { type: 'application/json' });
+    if (navigator.canShare?.({ files: [file] })) { await navigator.share({ files: [file], title: 'Nudge backup' }); return; }
+  } catch (e) { if (e?.name === 'AbortError') return; }
+  await writeBackup();
+  toast(backupState.at ? 'Saved to Documents/Nudge' : "Couldn't save a copy");
 }
 
 /* ---------------- Toast ---------------- */
@@ -715,6 +803,7 @@ function openSettings() {
   $('#set-key').value = settings.key;
   settings.times.forEach((t, n) => ($(`#set-t${n}`).value = t));
   $('#set-model').value = settings.model;
+  renderBackupStatus();
   openSheet('#settings');
 }
 
@@ -765,6 +854,7 @@ function bind() {
   };
 
   $('#list').addEventListener('click', async (e) => {
+    if (e.target.closest('[data-act="restore"]')) { $('#restore-input').click(); return; }
     const jb = e.target.closest('[data-job-act]');
     if (jb) {
       const id = jb.closest('[data-job]').dataset.job;
@@ -818,8 +908,15 @@ function bind() {
     settings.times = [0, 1, 2].map((n) => $(`#set-t${n}`).value || DEFAULTS.times[n]);
     settings.model = $('#set-model').value.trim() || DEFAULTS.model;
     await saveSettings();
-    closeSheets(); render(); await reschedule();
+    closeSheets(); render(); await reschedule(); scheduleBackup();
     toast('Saved');
+  };
+  $('#set-restore').onclick = () => $('#restore-input').click();
+  $('#set-backup').onclick = saveCopyNow;
+  $('#restore-input').onchange = async (e) => {
+    const f = e.target.files?.[0];
+    e.target.value = '';
+    if (f) await restoreFromFile(f);
   };
   $('#set-exact').onclick = async () => {
     if (!isNative) return toast('Only on the phone');
@@ -846,10 +943,12 @@ function bind() {
 (async function init() {
   await load();
   await loadJobs();
+  await loadBackupState();
   bind();
   render();
   if (await loadDraft()) showPaused('You have an unfinished recording from earlier. Nothing has been sent. Carry on where you stopped, or finish now.');
   retryJobs();
   await setupNotifications();
   await reschedule();
+  scheduleBackup();
 })();

@@ -201,3 +201,9 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
 .overlay.paused .rec-time { color: var(--muted); }
 .rec-label { margin: -6px 0 14px; font-size: 14px; color: var(--muted); }
 .rec-actions { display: flex; gap: 12px; align-items: center; justify-content: center; }
+
+/* Backup */
+.backup-box { border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px 4px; }
+.backup-box h3 { margin: 0 0 4px; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+.backup-box .context { margin: 0 0 4px; }
+.backup-box .row-end { margin-right: -10px; }

@@ -99,6 +99,14 @@
       <label class="field"><span>Night</span><input type="time" id="set-t2" /></label>
     </div>
     <label class="field"><span>Model</span><input type="text" id="set-model" autocomplete="off" /></label>
+    <div class="backup-box">
+      <h3>Backup</h3>
+      <p class="context" id="backup-status"></p>
+      <div class="row-end">
+        <button class="text-btn" id="set-restore">Restore from file</button>
+        <button class="text-btn" id="set-backup">Save a copy now</button>
+      </div>
+    </div>
     <div class="stack">
       <button class="secondary" id="set-exact">Allow on-time alerts</button>
       <button class="secondary" id="set-test">Send a test notification</button>
@@ -110,6 +118,7 @@
   </div>
 </section>
 
+<input type="file" id="restore-input" accept="application/json,.json,text/plain" hidden />
 <div class="toast" id="toast" hidden><span id="toast-msg"></span><button class="text-btn" id="toast-action" hidden></button></div>
 
 <script src="app.js"></script>

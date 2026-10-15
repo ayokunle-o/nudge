@@ -36,3 +36,8 @@ if [ -n "${GITHUB_RUN_NUMBER:-}" ]; then
   sed -i -E "s/versionCode [0-9]+/versionCode ${GITHUB_RUN_NUMBER}/; s/versionName \"[^\"]*\"/versionName \"1.${GITHUB_RUN_NUMBER}\"/" "$gradle"
 fi
 grep -nE "versionCode|versionName|storeFile" "$gradle"
+
+# Lets the automatic backup reach Documents/Nudge on Android 10 and older (newer phones need no permission).
+if ! grep -q WRITE_EXTERNAL_STORAGE "$manifest"; then
+  sed -i 's#</manifest>#    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />\n</manifest>#' "$manifest"
+fi
