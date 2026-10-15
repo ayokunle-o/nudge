@@ -207,3 +207,8 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
 .backup-box h3 { margin: 0 0 4px; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
 .backup-box .context { margin: 0 0 4px; }
 .backup-box .row-end { margin-right: -10px; }
+.empty-actions { display: flex; flex-direction: column; gap: 8px; margin: 22px auto 0; max-width: 320px; }
+.empty-actions .secondary { text-align: center; color: var(--accent); font-weight: 600; }
+.row-end.wrap { flex-wrap: wrap; }
+.overlay.busy .mic, .overlay.busy .rec-actions, .overlay.busy .rec-label { display: none !important; }
+.overlay.busy .rec-time { font-size: 32px; margin: 8px 0; }

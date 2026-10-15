@@ -565,7 +565,7 @@ function render() {
   const done = items.filter((i) => i.done).sort((a, b) => (b.doneAt || '').localeCompare(a.doneAt || ''));
 
   if (!items.length && !jobs.length) {
-    $('#list').innerHTML = `<div class="empty"><h2>Nothing to remember yet</h2><p>After a conversation, tap the mic and just talk. Nudge sorts it out and checks in with you morning, afternoon and night.</p><button class="text-btn" data-act="restore" style="margin-top:14px">Reinstalled? Restore your list from a backup</button></div>`;
+    $('#list').innerHTML = `<div class="empty"><h2>Nothing to remember yet</h2><p>After a conversation, tap the mic and just talk. Nudge sorts it out and checks in with you morning, afternoon and night.</p><div class="empty-actions"><button class="secondary" data-act="restore">Restore from a backup file</button><button class="secondary" data-act="import-shots">Import from screenshots of your old list</button></div></div>`;
     return;
   }
 
@@ -667,6 +667,74 @@ async function restoreFromFile(file) {
   closeSheets();
   await commit();
   toast(added ? `Restored ${added} ${added === 1 ? 'item' : 'items'}` : 'Everything in that backup is already here');
+}
+
+/* ---------------- Import from screenshots ----------------
+   Reads screenshots of a to-do / reminder list (e.g. an older copy of Nudge) and rebuilds the items. */
+function importPrompt(count) {
+  return `These ${count > 1 ? `${count} images are screenshots` : 'image is a screenshot'} of his previous reminder list (most likely an older copy of this same app, Nudge, possibly scrolled across several screenshots). Rebuild his list from ${count > 1 ? 'them' : 'it'}.
+Today's date is ${todayStr()} (UTC${tzOffset()}).
+
+How the Nudge screen is laid out: items sit in cards grouped under headings such as "On your mind today", "Tomorrow", or a date like "Tue, Oct 13", and a "Done" section at the bottom. Each card has the item text in bold, sometimes a grey detail line under it, sometimes a shaded box with a date and an update note, and coloured chips: "Follow up", "To do" or "Keep in mind", a person's name, and sometimes a time like "3:00 PM".
+
+His current items (do not duplicate these):
+${knownItems()}
+
+Return one entry per card you can read:
+- existing_id: the id of a matching current item if one exists, otherwise null.
+- update: the text of the shaded update box if there is one, otherwise null.
+- status: "done" if it is in the Done section or struck through, otherwise "open".
+- text: the bold item text exactly as shown.
+- kind: from the chip ("Follow up" -> "follow-up", "To do" -> "to-do", "Keep in mind" -> "keep in mind"); if no chip, choose the best fit.
+- person: the person chip text, or null.
+- context: the grey detail line, or null.
+- start_date: YYYY-MM-DD from the heading it sits under ("On your mind today" -> today; "Tomorrow" -> tomorrow; a date heading -> that date in the current or next year). Default today.
+- remind_at: if a time chip is shown, that time on the start date as ISO 8601 with offset ${tzOffset()}; otherwise null.
+
+If the same card appears in two overlapping screenshots, return it once. Skip anything that is not a list item (headers, buttons, banners, status bar). If the image is not a list at all, return an empty items list.
+Also return "transcript": a plain-text list of what you read, one item per line.`;
+}
+
+// Shrinks a picked image so uploads stay small and fast.
+function imageToJpeg(file, max = 1600) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, max / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      resolve(c.toDataURL('image/jpeg', 0.85).split(',')[1]);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Couldn't open that image")); };
+    img.src = url;
+  });
+}
+
+async function importScreenshots(files) {
+  if (!files.length) return;
+  if (!settings.key.trim()) { openSettings(); toast('Add your Gemini key first, then import'); return; }
+  closeSheets();
+  const ov = $('#rec');
+  ov.hidden = false; ov.classList.remove('paused'); ov.classList.add('busy');
+  $('#rec-state').textContent = 'Reading screenshots';
+  $('#rec-time').textContent = `${files.length} ${files.length === 1 ? 'image' : 'images'}`;
+  $('#rec-hint').textContent = 'Rebuilding your list. This takes a few seconds.';
+  try {
+    const parts = [{ text: importPrompt(files.length) }];
+    for (const f of files.slice(0, 10)) parts.push({ inline_data: { mime_type: 'image/jpeg', data: await imageToJpeg(f) } });
+    const result = await understand(parts);
+    const change = applyResult(result);
+    ov.hidden = true;
+    await commit();
+    if (change.created || change.updated) toast(`Imported · ${changeSummary(change)}`, 'Undo', async () => { change.undo(); await commit(); });
+    else toast("Couldn't find any list items in those screenshots");
+  } catch (e) {
+    ov.hidden = true;
+    toast(friendlyError(e));
+  }
 }
 
 async function saveCopyNow() {
@@ -855,6 +923,7 @@ function bind() {
 
   $('#list').addEventListener('click', async (e) => {
     if (e.target.closest('[data-act="restore"]')) { $('#restore-input').click(); return; }
+    if (e.target.closest('[data-act="import-shots"]')) { $('#shots-input').click(); return; }
     const jb = e.target.closest('[data-job-act]');
     if (jb) {
       const id = jb.closest('[data-job]').dataset.job;
@@ -912,6 +981,12 @@ function bind() {
     toast('Saved');
   };
   $('#set-restore').onclick = () => $('#restore-input').click();
+  $('#set-shots').onclick = () => $('#shots-input').click();
+  $('#shots-input').onchange = async (e) => {
+    const files = [...(e.target.files || [])];
+    e.target.value = '';
+    await importScreenshots(files);
+  };
   $('#set-backup').onclick = saveCopyNow;
   $('#restore-input').onchange = async (e) => {
     const f = e.target.files?.[0];
