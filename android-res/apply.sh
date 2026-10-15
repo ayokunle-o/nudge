@@ -9,3 +9,30 @@ if ! grep -q RECORD_AUDIO "$manifest"; then
   sed -i 's#</manifest>#    <uses-permission android:name="android.permission.RECORD_AUDIO" />\n    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />\n</manifest>#' "$manifest"
 fi
 grep -n "permission" "$manifest"
+
+# Sign every build with the same key in this repo, so new versions install over old ones.
+gradle="$here/../android/app/build.gradle"
+if ! grep -q "nudge-signing" "$gradle"; then
+  cat >> "$gradle" <<'GRADLE'
+
+// nudge-signing: fixed debug key so updates install over the previous version
+android {
+    signingConfigs {
+        debug {
+            storeFile file("../../android-res/debug.keystore")
+            storePassword "android"
+            keyAlias "androiddebugkey"
+            keyPassword "android"
+        }
+    }
+    buildTypes {
+        debug { signingConfig signingConfigs.debug }
+    }
+}
+GRADLE
+fi
+# Each build gets a higher version number (GitHub run number), so Android always treats it as an update.
+if [ -n "${GITHUB_RUN_NUMBER:-}" ]; then
+  sed -i -E "s/versionCode [0-9]+/versionCode ${GITHUB_RUN_NUMBER}/; s/versionName \"[^\"]*\"/versionName \"1.${GITHUB_RUN_NUMBER}\"/" "$gradle"
+fi
+grep -nE "versionCode|versionName|storeFile" "$gradle"

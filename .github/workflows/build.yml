@@ -35,11 +35,6 @@ jobs:
           bash android-res/apply.sh
           npx cap sync android
 
-      - name: Use the fixed signing key (so updates install over the old version)
-        run: |
-          mkdir -p ~/.android
-          cp android-res/debug.keystore ~/.android/debug.keystore
-
       - name: Compile APK
         working-directory: android
         run: ./gradlew assembleDebug --no-daemon --stacktrace
