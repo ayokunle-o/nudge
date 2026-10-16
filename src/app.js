@@ -5,6 +5,7 @@ import { App } from '@capacitor/app';
 import { Filesystem, Directory, Encoding } from '@capacitor/filesystem';
 import { Mp3Encoder } from '@breezystack/lamejs';
 import { KeepAwake } from '@capacitor-community/keep-awake';
+import { CapacitorCalendar } from '@ebarooni/capacitor-calendar';
 
 const isNative = Capacitor.isNativePlatform();
 const $ = (s) => document.querySelector(s);
@@ -64,6 +65,7 @@ const SCHEMA = {
           context: { type: 'STRING', nullable: true },
           start_date: { type: 'STRING' },
           remind_at: { type: 'STRING', nullable: true },
+          event_at: { type: 'STRING', nullable: true },
         },
         required: ['text', 'kind', 'start_date', 'status'],
       },
@@ -93,7 +95,7 @@ He usually records this right after a conversation (often with his wife) or when
 
 His current items:
 ${knownItems()}
-
+${calendarContext()}
 For every distinct thing in what he says, return one entry:
 - existing_id: if it is news about, or a continuation of, one of his current items (same person and same topic, even if worded differently, e.g. "the interview" / "her job thing"), the id of that item. Otherwise null. Never create a new entry for something that matches an existing item.
 - update: when existing_id is set, one short line saying what's new, in his terms (e.g. "Interview went well, she's waiting to hear back by Friday"). Otherwise null.
@@ -103,7 +105,8 @@ For every distinct thing in what he says, return one entry:
 - person: who it is about, as he referred to them, or null. For an update, keep the existing item's person unless he says otherwise.
 - context: one short line of the most useful current detail (time, place, why it matters), or null.
 - start_date: YYYY-MM-DD for when the next nudges should begin. Default today. If the next step only makes sense after an event or a date he mentions, use that date. Resolve "tomorrow", "next week", "on Friday" to a date.
-- remind_at: full ISO 8601 local datetime with offset (e.g. ${localIso(addDays(now, 1)).slice(0, 11)}09:00:00${tzOffset()}) ONLY if he gave or clearly implied a specific time ("at 3pm", "after her 10am interview" -> shortly after 10am, "tomorrow morning" -> 09:00). Otherwise null.
+- remind_at: full ISO 8601 local datetime with offset (e.g. ${localIso(addDays(now, 1)).slice(0, 11)}09:00:00${tzOffset()}) ONLY if he gave or clearly implied a specific time ("at 3pm", "after her 10am interview" -> shortly after 10am, "tomorrow morning" -> 09:00, "after my 2pm call" -> use his calendar). Otherwise null.
+- event_at: ONLY for something of his own that happens at a set time (his interview, meeting, appointment, call, class), the ISO 8601 local datetime it starts, with offset. This goes on his calendar. Null for follow-ups about other people's events, tasks without a fixed time, and anything already on his calendar.
 
 Ignore filler and repetition. Do not invent items or updates. Leave untouched any existing item he does not mention. If nothing is worth saving, return an empty items list.
 Also return "transcript": a clean, lightly punctuated transcript of what he said.`;
@@ -161,6 +164,8 @@ function applyResult(result, source) {
     if (!r.text) continue;
     let remindAt = null;
     if (r.remind_at) { const d = new Date(r.remind_at); if (!isNaN(d)) remindAt = d.toISOString(); }
+    let eventAt = null;
+    if (r.event_at) { const d = new Date(r.event_at); if (!isNaN(d)) eventAt = d.toISOString(); }
     let start = /^\d{4}-\d{2}-\d{2}$/.test(r.start_date || '') ? r.start_date : t;
     if (remindAt) { const rd = ymd(new Date(remindAt)); if (rd < start) start = rd; }
     if (start < t) start = t;
@@ -177,6 +182,7 @@ function applyResult(result, source) {
       existing.context = r.context || null;
       existing.startDate = start;
       existing.remindAt = remindAt;
+      if (eventAt || r.event_at === null) existing.eventAt = eventAt;
       existing.done = done;
       existing.doneAt = done ? nowIso : null;
       existing.updatedAt = nowIso;
@@ -190,6 +196,7 @@ function applyResult(result, source) {
       context: r.context || null,
       startDate: start,
       remindAt,
+      eventAt,
       done,
       doneAt: done ? nowIso : null,
       createdAt: nowIso,
@@ -478,18 +485,27 @@ async function reschedule() {
       const day = addDays(now, d);
       const ds = ymd(day);
       const act = activeOn(ds);
+      const evs = calOn() ? eventsOn(ds) : [];
       settings.times.forEach((t, slot) => {
         const [hh, mm] = (t || '08:00').split(':').map(Number);
         const at = new Date(day.getFullYear(), day.getMonth(), day.getDate(), hh, mm);
-        if (at <= now || !act.length) return;
-        const lines = act.slice(0, 7).map((i) => `• ${i.text}`);
+        const dayEvs = slot === 0 ? evs : [];
+        if (at <= now || (!act.length && !dayEvs.length)) return;
+        const lines = [];
+        if (dayEvs.length) {
+          lines.push(`Calendar: ${dayEvs.slice(0, 4).map((e) => `${evTime(e)} ${e.title}`).join(' · ')}${dayEvs.length > 4 ? ` +${dayEvs.length - 4}` : ''}`);
+        }
+        lines.push(...act.slice(0, 7).map((i) => `• ${i.text}`));
         if (act.length > 7) lines.push(`+ ${act.length - 7} more`);
+        const body = act.length
+          ? (act.length === 1 ? act[0].text : `${act[0].text} (+${act.length - 1} more)`)
+          : `${dayEvs.length} on your calendar today: ${dayEvs[0].title}${dayEvs.length > 1 ? ' and more' : ''}`;
         list.push({
           id: 1000 + d * 10 + slot,
           title: SLOTS[slot].title,
-          body: act.length === 1 ? act[0].text : `${act[0].text} (+${act.length - 1} more)`,
+          body,
           largeBody: lines.join('\n'),
-          summaryText: `${act.length} to remember`,
+          summaryText: act.length ? `${act.length} to remember` : 'Your day',
           channelId: 'nudges',
           schedule: { at, allowWhileIdle: true },
         });
@@ -573,11 +589,11 @@ function render() {
   const done = items.filter((i) => i.done).sort((a, b) => (b.doneAt || '').localeCompare(a.doneAt || ''));
 
   if (!items.length && !jobs.length) {
-    $('#list').innerHTML = `<div class="empty"><h2>Nothing to remember yet</h2><p>After a conversation, tap the mic and just talk. Nudge sorts it out and checks in with you morning, afternoon and night.</p><div class="empty-actions"><button class="secondary" data-act="restore">Restore from a backup file</button><button class="secondary" data-act="import-shots">Import from screenshots of your old list</button></div></div>`;
+    $('#list').innerHTML = calendarHtml() + `<div class="empty"><h2>Nothing to remember yet</h2><p>After a conversation, tap the mic and just talk. Nudge sorts it out and checks in with you morning, afternoon and night.</p><div class="empty-actions"><button class="secondary" data-act="restore">Restore from a backup file</button><button class="secondary" data-act="import-shots">Import from screenshots of your old list</button></div></div>`;
     return;
   }
 
-  let html = jobsHtml();
+  let html = jobsHtml() + calendarHtml();
   if (!items.length) { $('#list').innerHTML = html; return; }
   html += `<section class="group"><div class="group-head"><h2>On your mind today</h2><span class="count">${now.length}</span></div>${
     now.length ? now.map(cardHtml).join('') : `<p class="context" style="margin:0 2px">All clear for today.</p>`}</section>`;
@@ -600,6 +616,152 @@ async function commit() {
   render();
   await reschedule();
   scheduleBackup();
+  syncCalendar();
+}
+
+/* ---------------- Calendar ----------------
+   Uses the phone's calendar (which syncs with Google Calendar), so there's no separate sign-in.
+   - Items with a time go onto the calendar, and are updated or removed when they change.
+   - Upcoming events are read in, shown on the home screen, added to morning check-ins,
+     and given to Gemini so "after my 2pm call" makes sense. */
+const NUDGE_MARK = '(Added by Nudge)';
+let calEvents = []; // upcoming events from the calendar, excluding Nudge's own
+let calSyncing = false;
+
+const calNative = () => isNative || !!window.__nudgeCalTest; // test hook for the browser harness
+const calOn = () => calNative() && settings.calendar?.enabled;
+
+async function connectCalendar() {
+  if (!calNative()) return toast('Only on the phone');
+  try {
+    const { result } = await CapacitorCalendar.requestFullCalendarAccess();
+    if (result !== 'granted') {
+      toast('Calendar permission was not given. You can allow it in Android Settings → Apps → Nudge.');
+      return;
+    }
+    let cal = null;
+    try { cal = (await CapacitorCalendar.getDefaultCalendar({ useFallbackCalendar: true })).result; } catch {}
+    settings.calendar = { enabled: true, id: cal?.id || null, name: cal?.title || cal?.internalTitle || 'your calendar' };
+    await saveSettings();
+    renderCalendarStatus();
+    await refreshCalendar();
+    await syncCalendar();
+    render(); await reschedule();
+    toast(`Calendar connected: ${settings.calendar.name}`);
+  } catch (e) {
+    toast(`Couldn't connect the calendar: ${friendlyError(e)}`);
+  }
+}
+
+async function disconnectCalendar() {
+  settings.calendar = { enabled: false };
+  calEvents = [];
+  await saveSettings();
+  renderCalendarStatus(); render(); await reschedule();
+  toast('Calendar disconnected. Events already added stay on your calendar.');
+}
+
+function renderCalendarStatus() {
+  const el = $('#cal-status');
+  if (!el) return;
+  const on = settings.calendar?.enabled;
+  el.textContent = on
+    ? `Connected to ${settings.calendar.name}. Anything with a set time goes on your calendar, and your events show in Nudge and in morning check-ins. Event titles and times are shared with Gemini when it sorts your notes.`
+    : "Connect your phone's calendar (it syncs with Google Calendar). Timed items like interviews go on your calendar, and your events show up in Nudge.";
+  $('#cal-connect').hidden = !!on;
+  $('#cal-disconnect').hidden = !on;
+}
+
+async function refreshCalendar() {
+  if (!calOn()) { calEvents = []; return; }
+  try {
+    const from = new Date(); from.setHours(0, 0, 0, 0);
+    const to = addDays(from, DAYS_AHEAD + 1);
+    const { result } = await CapacitorCalendar.listEventsInRange({ from: from.getTime(), to: to.getTime() });
+    const mine = new Set(items.map((i) => i.calEventId).filter(Boolean));
+    calEvents = (result || [])
+      .filter((e) => !mine.has(String(e.id)) && !(e.description || '').includes(NUDGE_MARK))
+      .map((e) => ({ id: String(e.id), title: e.title || '(No title)', start: e.startDate, end: e.endDate, allDay: !!e.isAllDay, location: e.location || null }))
+      .sort((a, b) => a.start - b.start);
+  } catch (e) {
+    console.warn('calendar read failed', e);
+  }
+}
+
+// Events on a given local day (all-day events are stored in UTC, so they're matched by UTC date).
+function eventsOn(dateStr) {
+  return calEvents.filter((e) => {
+    if (e.allDay) return new Date(e.start).toISOString().slice(0, 10) === dateStr;
+    const s = ymd(new Date(e.start)), en = ymd(new Date(Math.max(e.start, e.end - 1)));
+    return s <= dateStr && dateStr <= en;
+  });
+}
+const evTime = (e) => (e.allDay ? 'All day' : new Date(e.start).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' }));
+
+function calendarContext() {
+  if (!calOn() || !calEvents.length) return '';
+  const lines = calEvents.slice(0, 40).map((e) => `- ${e.allDay ? new Date(e.start).toISOString().slice(0, 10) + ' (all day)' : localIso(new Date(e.start)).slice(0, 16).replace('T', ' ')}: ${e.title}`);
+  return `\nHis calendar for the coming days (for context only; don't create items for these unless he asks):\n${lines.join('\n')}\n`;
+}
+
+function calendarHtml() {
+  if (!calOn()) return '';
+  const now = Date.now();
+  const today = eventsOn(todayStr()).filter((e) => e.allDay || e.end > now);
+  if (!today.length) return '';
+  return `<section class="group cal"><div class="group-head"><h2>Today on your calendar</h2><span class="count">${today.length}</span></div>
+    <div class="cal-list">${today.map((e) => `<div class="cal-row${!e.allDay && e.start <= now ? ' now' : ''}"><span class="cal-time">${evTime(e)}</span><span class="cal-title">${esc(e.title)}${e.location ? `<span class="cal-loc">${esc(e.location)}</span>` : ''}</span></div>`).join('')}</div></section>`;
+}
+
+// Puts timed items on the calendar and keeps them in step with Nudge.
+async function syncCalendar() {
+  if (!calOn() || calSyncing) return;
+  calSyncing = true;
+  let changed = false;
+  try {
+    const known = JSON.parse((await Preferences.get({ key: 'calLinks' })).value || '{}'); // itemId -> eventId
+    const alive = new Set();
+    for (const i of items) {
+      const when = i.eventAt || i.remindAt;
+      const want = !i.done && when && new Date(when).getTime() > Date.now() - 6 * 3600e3;
+      if (!want) continue;
+      alive.add(i.id);
+      const start = new Date(when).getTime();
+      const sig = `${i.text}|${start}|${i.context || ''}`;
+      const opts = {
+        title: i.text, startDate: start, endDate: start + 30 * 60e3,
+        description: `${i.context ? i.context + '\n\n' : ''}${NUDGE_MARK}`,
+        ...(settings.calendar.id ? { calendarId: settings.calendar.id } : {}),
+      };
+      try {
+        if (i.calEventId && i.calSig === sig) continue;
+        if (i.calEventId) {
+          try { await CapacitorCalendar.modifyEvent({ id: i.calEventId, ...opts }); }
+          catch { i.calEventId = null; }
+        }
+        if (!i.calEventId) {
+          const { id } = await CapacitorCalendar.createEvent({ ...opts, commit: true });
+          i.calEventId = id ? String(id) : null;
+        }
+        i.calSig = sig; known[i.id] = i.calEventId; changed = true;
+      } catch (e) { console.warn('calendar write failed', e); }
+    }
+    // Remove events for items that were finished, deleted or lost their time.
+    for (const [itemId, eventId] of Object.entries(known)) {
+      if (alive.has(itemId) || !eventId) continue;
+      try { await CapacitorCalendar.deleteEvent({ id: eventId }); } catch {}
+      delete known[itemId];
+      const it = items.find((x) => x.id === itemId);
+      if (it) { it.calEventId = null; it.calSig = null; }
+      changed = true;
+    }
+    await Preferences.set({ key: 'calLinks', value: JSON.stringify(known) });
+    if (changed) await saveItems();
+  } catch (e) {
+    console.warn('calendar sync failed', e);
+  } finally {
+    calSyncing = false;
+  }
 }
 
 /* ---------------- Backup that survives uninstalling ----------------
@@ -698,6 +860,7 @@ Return one entry per card you can read:
 - context: the grey detail line, or null.
 - start_date: YYYY-MM-DD from the heading it sits under ("On your mind today" -> today; "Tomorrow" -> tomorrow; a date heading -> that date in the current or next year). Default today.
 - remind_at: if a time chip is shown, that time on the start date as ISO 8601 with offset ${tzOffset()}; otherwise null.
+- event_at: if the card describes his own appointment at a stated time (e.g. "Interview at 4 PM"), that start time as ISO 8601 with offset; otherwise null.
 
 If the same card appears in two overlapping screenshots, return it once. Skip anything that is not a list item (headers, buttons, banners, status bar). If the image is not a list at all, return an empty items list.
 Also return "transcript": a plain-text list of what you read, one item per line.`;
@@ -924,6 +1087,7 @@ function openSettings() {
   settings.times.forEach((t, n) => ($(`#set-t${n}`).value = t));
   $('#set-model').value = settings.model;
   renderBackupStatus();
+  renderCalendarStatus();
   openSheet('#settings');
 }
 
@@ -1033,6 +1197,8 @@ function bind() {
     closeSheets(); render(); await reschedule(); scheduleBackup();
     toast('Saved');
   };
+  $('#cal-connect').onclick = connectCalendar;
+  $('#cal-disconnect').onclick = disconnectCalendar;
   $('#set-restore').onclick = () => $('#restore-input').click();
   $('#set-shots').onclick = () => $('#shots-input').click();
   $('#shots-input').onchange = async (e) => {
@@ -1064,7 +1230,7 @@ function bind() {
   App.addListener('appStateChange', ({ isActive }) => {
     appActive = isActive;
     if (!isActive && session?.live) pauseCapture(); // screen off / call / app switch: pause, never send half a note
-    if (isActive) { render(); reschedule(); retryJobs(); }
+    if (isActive) { refreshCalendar().then(() => { render(); reschedule(); syncCalendar(); }); retryJobs(); }
   });
 }
 
@@ -1077,6 +1243,9 @@ function bind() {
   if (await loadDraft()) showPaused('You have an unfinished recording from earlier. Nothing has been sent. Carry on where you stopped, or finish now.');
   retryJobs();
   await setupNotifications();
+  await refreshCalendar();
+  render();
   await reschedule();
   scheduleBackup();
+  syncCalendar();
 })();

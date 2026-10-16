@@ -216,3 +216,12 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
 .overlay.busy .only-busy { display: block; }
 .overlay.importing .only-importing { display: inline-block; }
 .spinner.big { width: 34px; height: 34px; border-width: 3px; margin: 26px auto 10px; }
+
+/* Calendar */
+.cal-list { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 4px 14px; }
+.cal-row { display: flex; gap: 14px; padding: 10px 0; border-bottom: 1px solid var(--line); align-items: baseline; }
+.cal-row:last-child { border-bottom: 0; }
+.cal-time { flex: none; width: 72px; font-size: 14px; font-weight: 600; color: var(--todo); font-variant-numeric: tabular-nums; }
+.cal-row.now .cal-time { color: var(--accent); }
+.cal-title { font-size: 15px; min-width: 0; overflow-wrap: anywhere; }
+.cal-loc { display: block; font-size: 13px; color: var(--muted); }

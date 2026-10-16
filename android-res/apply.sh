@@ -41,3 +41,8 @@ grep -nE "versionCode|versionName|storeFile" "$gradle"
 if ! grep -q WRITE_EXTERNAL_STORAGE "$manifest"; then
   sed -i 's#</manifest>#    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />\n</manifest>#' "$manifest"
 fi
+
+# Calendar access: timed items go onto the phone's calendar and events are read into check-ins.
+if ! grep -q READ_CALENDAR "$manifest"; then
+  sed -i 's#</manifest>#    <uses-permission android:name="android.permission.READ_CALENDAR" />\n    <uses-permission android:name="android.permission.WRITE_CALENDAR" />\n</manifest>#' "$manifest"
+fi
