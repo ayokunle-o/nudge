@@ -106,6 +106,7 @@
       <p class="context" id="cal-status"></p>
       <div class="row-end">
         <button class="text-btn danger" id="cal-disconnect" hidden>Disconnect</button>
+        <button class="text-btn" id="cal-change" hidden>Change calendars</button>
         <button class="text-btn" id="cal-connect">Connect calendar</button>
       </div>
     </div>
@@ -125,6 +126,25 @@
     <div class="row-end">
       <button class="text-btn" data-close>Close</button>
       <button class="primary" id="set-save">Save</button>
+    </div>
+  </div>
+</section>
+
+<!-- Calendar picker -->
+<section class="sheet" id="cal-sheet" hidden>
+  <div class="sheet-card">
+    <h2>Choose calendars</h2>
+    <div class="cal-pick">
+      <h3>Add timed items to</h3>
+      <div id="cal-write-list"></div>
+    </div>
+    <div class="cal-pick">
+      <h3>Show events from</h3>
+      <div id="cal-read-list"></div>
+    </div>
+    <div class="row-end">
+      <button class="text-btn" data-close>Cancel</button>
+      <button class="primary" id="cal-save">Save</button>
     </div>
   </div>
 </section>

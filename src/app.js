@@ -631,6 +631,8 @@ let calSyncing = false;
 const calNative = () => isNative || !!window.__nudgeCalTest; // test hook for the browser harness
 const calOn = () => calNative() && settings.calendar?.enabled;
 
+let calList = [];
+
 async function connectCalendar() {
   if (!calNative()) return toast('Only on the phone');
   try {
@@ -639,18 +641,62 @@ async function connectCalendar() {
       toast('Calendar permission was not given. You can allow it in Android Settings → Apps → Nudge.');
       return;
     }
-    let cal = null;
-    try { cal = (await CapacitorCalendar.getDefaultCalendar({ useFallbackCalendar: true })).result; } catch {}
-    settings.calendar = { enabled: true, id: cal?.id || null, name: cal?.title || cal?.internalTitle || 'your calendar' };
-    await saveSettings();
-    renderCalendarStatus();
-    await refreshCalendar();
-    await syncCalendar();
-    render(); await reschedule();
-    toast(`Calendar connected: ${settings.calendar.name}`);
+    await openCalendarPicker();
   } catch (e) {
     toast(`Couldn't connect the calendar: ${friendlyError(e)}`);
   }
+}
+
+const calLabel = (c) => c.title || c.internalTitle || 'Calendar';
+const calAccount = (c) => c.accountName || c.ownerAccount || 'On this phone';
+const isHoliday = (c) => /holiday|birthday|contacts|week numbers/i.test(`${c.title} ${c.internalTitle} ${c.accountName}`);
+
+// Lets him choose which account/calendar Nudge writes to, and which calendars it reads.
+async function openCalendarPicker() {
+  try { calList = (await CapacitorCalendar.listCalendars()).result || []; } catch (e) { return toast(`Couldn't list calendars: ${friendlyError(e)}`); }
+  if (!calList.length) return toast('No calendars found on this phone');
+  const cur = settings.calendar || {};
+  const writable = calList.filter((c) => c.allowsContentModifications !== false && !c.isImmutable && !isHoliday(c));
+  const writeId = cur.id && calList.some((c) => c.id === cur.id) ? cur.id : (writable[0] || calList[0]).id;
+  const readIds = new Set(cur.read && cur.read.length ? cur.read : calList.filter((c) => calAccount(c) === calAccount(calList.find((x) => x.id === writeId))).map((c) => c.id));
+
+  const groups = {};
+  for (const c of calList) (groups[calAccount(c)] ||= []).push(c);
+  const dot = (c) => `<span class="cal-dot" style="background:${esc(c.color || '#888')}"></span>`;
+  $('#cal-write-list').innerHTML = Object.entries(groups).map(([acct, cals]) => {
+    const rows = cals.filter((c) => writable.includes(c));
+    if (!rows.length) return '';
+    return `<p class="cal-acct">${esc(acct)}</p>` + rows.map((c) =>
+      `<label class="cal-opt"><input type="radio" name="cal-write" value="${esc(c.id)}"${c.id === writeId ? ' checked' : ''}/>${dot(c)}<span>${esc(calLabel(c))}</span></label>`).join('');
+  }).join('');
+  $('#cal-read-list').innerHTML = Object.entries(groups).map(([acct, cals]) =>
+    `<p class="cal-acct">${esc(acct)}</p>` + cals.map((c) =>
+      `<label class="cal-opt"><input type="checkbox" value="${esc(c.id)}"${readIds.has(c.id) ? ' checked' : ''}/>${dot(c)}<span>${esc(calLabel(c))}</span></label>`).join('')).join('');
+  // Picking a write calendar in another account switches the "show" ticks to that account.
+  $('#cal-write-list').onchange = (e) => {
+    const c = calList.find((x) => x.id === e.target.value);
+    if (!c) return;
+    $('#cal-read-list').querySelectorAll('input').forEach((box) => {
+      const bc = calList.find((x) => x.id === box.value);
+      box.checked = bc && calAccount(bc) === calAccount(c) && !isHoliday(bc) ? true : (bc?.id === c.id);
+    });
+  };
+  closeSheets();
+  openSheet('#cal-sheet');
+}
+
+async function saveCalendarChoice() {
+  const w = $('#cal-write-list input:checked')?.value;
+  const read = [...$('#cal-read-list').querySelectorAll('input:checked')].map((x) => x.value);
+  const c = calList.find((x) => x.id === w);
+  if (!c) return toast('Choose a calendar to add events to');
+  settings.calendar = { enabled: true, id: c.id, name: calLabel(c), account: calAccount(c), read };
+  await saveSettings();
+  closeSheets();
+  await refreshCalendar();
+  await syncCalendar();
+  render(); await reschedule();
+  toast(`Calendar: ${c.accountName && c.accountName !== calLabel(c) ? `${calLabel(c)} (${c.accountName})` : calLabel(c)}`);
 }
 
 async function disconnectCalendar() {
@@ -665,11 +711,13 @@ function renderCalendarStatus() {
   const el = $('#cal-status');
   if (!el) return;
   const on = settings.calendar?.enabled;
+  const where = on ? (settings.calendar.account && settings.calendar.account !== settings.calendar.name ? `${settings.calendar.name} (${settings.calendar.account})` : settings.calendar.name) : '';
   el.textContent = on
-    ? `Connected to ${settings.calendar.name}. Anything with a set time goes on your calendar, and your events show in Nudge and in morning check-ins. Event titles and times are shared with Gemini when it sorts your notes.`
+    ? `Adding events to ${where}, showing ${settings.calendar.read?.length ? `${settings.calendar.read.length} calendar${settings.calendar.read.length === 1 ? '' : 's'}` : 'all calendars'}. Anything with a set time goes on your calendar, and your events show in Nudge and in morning check-ins. Event titles and times are shared with Gemini when it sorts your notes.`
     : "Connect your phone's calendar (it syncs with Google Calendar). Timed items like interviews go on your calendar, and your events show up in Nudge.";
   $('#cal-connect').hidden = !!on;
   $('#cal-disconnect').hidden = !on;
+  $('#cal-change').hidden = !on;
 }
 
 async function refreshCalendar() {
@@ -679,8 +727,10 @@ async function refreshCalendar() {
     const to = addDays(from, DAYS_AHEAD + 1);
     const { result } = await CapacitorCalendar.listEventsInRange({ from: from.getTime(), to: to.getTime() });
     const mine = new Set(items.map((i) => i.calEventId).filter(Boolean));
+    const read = settings.calendar.read?.length ? new Set(settings.calendar.read.map(String)) : null;
     calEvents = (result || [])
       .filter((e) => !mine.has(String(e.id)) && !(e.description || '').includes(NUDGE_MARK))
+      .filter((e) => !read || read.has(String(e.calendarId)))
       .map((e) => ({ id: String(e.id), title: e.title || '(No title)', start: e.startDate, end: e.endDate, allDay: !!e.isAllDay, location: e.location || null }))
       .sort((a, b) => a.start - b.start);
   } catch (e) {
@@ -734,6 +784,13 @@ async function syncCalendar() {
         ...(settings.calendar.id ? { calendarId: settings.calendar.id } : {}),
       };
       try {
+        const calId = settings.calendar.id || null;
+        if (i.calEventId && i.calCalId !== calId) {
+          // Target calendar changed (e.g. wrong account picked first): move the event.
+          try { await CapacitorCalendar.deleteEvent({ id: i.calEventId }); } catch {}
+          i.calEventId = null;
+        }
+        i.calCalId = calId;
         if (i.calEventId && i.calSig === sig) continue;
         if (i.calEventId) {
           try { await CapacitorCalendar.modifyEvent({ id: i.calEventId, ...opts }); }
@@ -1199,6 +1256,8 @@ function bind() {
   };
   $('#cal-connect').onclick = connectCalendar;
   $('#cal-disconnect').onclick = disconnectCalendar;
+  $('#cal-change').onclick = openCalendarPicker;
+  $('#cal-save').onclick = saveCalendarChoice;
   $('#set-restore').onclick = () => $('#restore-input').click();
   $('#set-shots').onclick = () => $('#shots-input').click();
   $('#shots-input').onchange = async (e) => {
