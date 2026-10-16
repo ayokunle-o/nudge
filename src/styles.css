@@ -212,3 +212,7 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
 .row-end.wrap { flex-wrap: wrap; }
 .overlay.busy .mic, .overlay.busy .rec-actions, .overlay.busy .rec-label { display: none !important; }
 .overlay.busy .rec-time { font-size: 32px; margin: 8px 0; }
+.overlay .only-busy, .overlay .only-importing { display: none; }
+.overlay.busy .only-busy { display: block; }
+.overlay.importing .only-importing { display: inline-block; }
+.spinner.big { width: 34px; height: 34px; border-width: 3px; margin: 26px auto 10px; }

@@ -128,13 +128,21 @@ async function callGemini(parts, model) {
   return JSON.parse(text);
 }
 
-async function understand(parts) {
+// Never wait forever: if Gemini hasn't answered in time, give up so the user can retry.
+function withTimeout(promise, ms, msg) {
+  let t;
+  return Promise.race([promise, new Promise((_, rej) => { t = setTimeout(() => rej(Object.assign(new Error(msg), { timeout: true })), ms); })])
+    .finally(() => clearTimeout(t));
+}
+
+async function understand(parts, ms = 120000) {
   if (!settings.key.trim()) throw new Error('Add your Gemini API key in Settings first.');
+  const once = (model) => withTimeout(callGemini(parts, model), ms, 'Gemini took too long to answer. Check your connection and try again.');
   try {
-    return await callGemini(parts, settings.model || DEFAULTS.model);
+    return await once(settings.model || DEFAULTS.model);
   } catch (e) {
     // If the chosen model name is gone, fall back once to a known one.
-    if (e.status === 404 && settings.model !== 'gemini-2.5-flash') return await callGemini(parts, 'gemini-2.5-flash');
+    if (e.status === 404 && settings.model !== 'gemini-2.5-flash') return await once('gemini-2.5-flash');
     throw e;
   }
 }
@@ -696,45 +704,89 @@ Also return "transcript": a plain-text list of what you read, one item per line.
 }
 
 // Shrinks a picked image so uploads stay small and fast.
-function imageToJpeg(file, max = 1600) {
+function readAsDataUrl(file) {
   return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      const scale = Math.min(1, max / Math.max(img.width, img.height));
-      const c = document.createElement('canvas');
-      c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
-      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
-      URL.revokeObjectURL(url);
-      resolve(c.toDataURL('image/jpeg', 0.85).split(',')[1]);
-    };
-    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Couldn't open that image")); };
-    img.src = url;
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(new Error("Couldn't read that image"));
+    r.readAsDataURL(file);
   });
 }
+async function imageToJpeg(file, max = 1600) {
+  const src = await withTimeout(readAsDataUrl(file), 20000, "Couldn't read that image");
+  const img = await withTimeout(new Promise((resolve, reject) => {
+    const im = new Image();
+    im.onload = () => resolve(im);
+    im.onerror = () => reject(new Error("Couldn't open that image"));
+    im.src = src;
+  }), 20000, "Couldn't open that image");
+  const scale = Math.min(1, max / Math.max(img.width, img.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(img.width * scale); c.height = Math.round(img.height * scale);
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', 0.85).split(',')[1];
+}
+
+let importCancelled = false;
+let cancelImport = () => {};
 
 async function importScreenshots(files) {
+  files = files.slice(0, 10);
   if (!files.length) return;
   if (!settings.key.trim()) { openSettings(); toast('Add your Gemini key first, then import'); return; }
   closeSheets();
+  importCancelled = false;
+  // Cancel stops waiting immediately, even mid-request.
+  const cancelled = new Promise((_, rej) => { cancelImport = () => { importCancelled = true; rej(Object.assign(new Error('cancelled'), { cancelled: true })); }; });
+  cancelled.catch(() => {});
   const ov = $('#rec');
-  ov.hidden = false; ov.classList.remove('paused'); ov.classList.add('busy');
-  $('#rec-state').textContent = 'Reading screenshots';
-  $('#rec-time').textContent = `${files.length} ${files.length === 1 ? 'image' : 'images'}`;
-  $('#rec-hint').textContent = 'Rebuilding your list. This takes a few seconds.';
+  ov.hidden = false; ov.classList.remove('paused'); ov.classList.add('busy', 'importing');
+  const started = Date.now();
+  let step = '';
+  const show = (title, hint) => { step = title; $('#rec-time').textContent = title; if (hint) $('#rec-hint').textContent = hint; };
+  $('#rec-state').textContent = 'Importing screenshots';
+  const clock = setInterval(() => {
+    const s = Math.floor((Date.now() - started) / 1000);
+    $('#rec-state').textContent = `Importing screenshots · ${Math.floor(s / 60)}:${pad(s % 60)}`;
+  }, 500);
+
+  const totals = { created: 0, updated: 0 };
+  const undos = [];
+  const failed = [];
   try {
-    const parts = [{ text: importPrompt(files.length) }];
-    for (const f of files.slice(0, 10)) parts.push({ inline_data: { mime_type: 'image/jpeg', data: await imageToJpeg(f) } });
-    const result = await understand(parts);
-    const change = applyResult(result);
+    for (let n = 0; n < files.length; n++) {
+      if (importCancelled) break;
+      const label = files.length > 1 ? `${n + 1} of ${files.length}` : '1 screenshot';
+      show(label, 'Preparing the image…');
+      try {
+        const data = await Promise.race([imageToJpeg(files[n]), cancelled]);
+        if (importCancelled) break;
+        show(label, 'Gemini is reading it. Usually 10–30 seconds.');
+        // Items found in earlier screenshots are part of the prompt, so overlaps aren't duplicated.
+        const result = await Promise.race([understand([{ text: importPrompt(1) }, { inline_data: { mime_type: 'image/jpeg', data } }], 90000), cancelled]);
+        if (importCancelled) break;
+        const change = applyResult(result);
+        totals.created += change.created; totals.updated += change.updated;
+        undos.push(change.undo);
+        await saveItems();
+      } catch (e) {
+        if (e?.cancelled) break;
+        failed.push({ n: n + 1, msg: friendlyError(e) });
+      }
+    }
+  } finally {
+    clearInterval(clock);
     ov.hidden = true;
-    await commit();
-    if (change.created || change.updated) toast(`Imported · ${changeSummary(change)}`, 'Undo', async () => { change.undo(); await commit(); });
-    else toast("Couldn't find any list items in those screenshots");
-  } catch (e) {
-    ov.hidden = true;
-    toast(friendlyError(e));
+    ov.classList.remove('importing');
   }
+  await commit();
+  const undoAll = async () => { for (const u of undos.reverse()) u(); await commit(); };
+  const got = totals.created || totals.updated;
+  if (importCancelled) toast(got ? `Stopped · kept ${changeSummary(totals)}` : 'Import cancelled', got ? 'Undo' : null, undoAll);
+  else if (failed.length && !got) toast(`Import failed: ${failed[0].msg}`);
+  else if (failed.length) toast(`Imported · ${changeSummary(totals)} · screenshot ${failed.map((f) => f.n).join(', ')} failed`, 'Undo', undoAll);
+  else if (got) toast(`Imported · ${changeSummary(totals)}`, 'Undo', undoAll);
+  else toast("Couldn't find any list items in those screenshots");
 }
 
 async function saveCopyNow() {
@@ -896,6 +948,7 @@ function bind() {
   $('#rec-stop').onclick = finishCapture;
   $('#rec-cancel').onclick = cancelCapture;
   $('#rec-resume').onclick = resumeCapture;
+  $('#rec-busy-cancel').onclick = () => cancelImport();
   $('#rec-finish').onclick = finishCapture;
   $('#open-settings').onclick = openSettings;
   $('#banner-settings').onclick = openSettings;
